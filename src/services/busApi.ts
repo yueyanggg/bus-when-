@@ -1,21 +1,28 @@
 import { generateSimulatedArrivals, SINGAPORE_BUS_STOPS } from '../data/singaporeStops';
-import { BusArrivalResponse, BusStop, SimulatedApiMode } from '../types/bus';
+import {
+  ApiHealthStatus,
+  BusArrivalResponse,
+  BusStop,
+  DataSourceMode,
+  SimulatedApiMode,
+} from '../types/bus';
 
-/**
- * Frontend API Adapter Layer
- * -----------------------------------------------------------------------------
- * Currently runs against local preview data (`generateSimulatedArrivals`) so the
- * frontend works out-of-the-box. When ready to connect your LTA DataMall proxy:
- *
- *   1. Set `API_CONFIG.useLiveEndpoint = true`
- *   2. Point `API_CONFIG.arrivalsEndpoint` to your backend proxy route
- *      (e.g. `/api/lta/bus-arrival`) so your LTA AccountKey stays server-side.
- */
 export const API_CONFIG = {
-  useLiveEndpoint: false,
-  arrivalsEndpoint: '/api/lta/bus-arrival',
-  stopsEndpoint: '/api/lta/bus-stops',
+  arrivalsEndpoint: '/api/busarrival',
+  healthEndpoint: '/api/health',
 };
+
+export class BusApiError extends Error {
+  code?: string;
+  status?: number;
+
+  constructor(message: string, code?: string, status?: number) {
+    super(message);
+    this.name = 'BusApiError';
+    this.code = code;
+    this.status = status;
+  }
+}
 
 export function getStopByCode(busStopCode: string): BusStop | undefined {
   const normalized = busStopCode.trim();
@@ -36,32 +43,75 @@ export function searchBusStops(query: string): BusStop[] {
   });
 }
 
+export async function fetchApiHealth(): Promise<ApiHealthStatus> {
+  const res = await fetch(API_CONFIG.healthEndpoint, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+
+  if (!res.ok) {
+    throw new BusApiError(`Health check failed (HTTP ${res.status})`, 'HEALTH_CHECK_FAILED', res.status);
+  }
+
+  return (await res.json()) as ApiHealthStatus;
+}
+
+export interface FetchArrivalsOptions {
+  dataSource: DataSourceMode;
+  simulatedMode?: SimulatedApiMode;
+  serviceNo?: string;
+}
+
 export async function fetchBusArrivals(
   busStopCode: string,
-  simulatedMode: SimulatedApiMode = 'live-preview'
+  options: FetchArrivalsOptions = { dataSource: 'live', simulatedMode: 'live-preview' }
 ): Promise<BusArrivalResponse> {
   const normalized = busStopCode.trim();
+  const { dataSource, simulatedMode = 'live-preview', serviceNo } = options;
 
-  if (API_CONFIG.useLiveEndpoint) {
-    const res = await fetch(`${API_CONFIG.arrivalsEndpoint}?BusStopCode=${encodeURIComponent(normalized)}`);
-    if (!res.ok) {
-      throw new Error(`Transit API returned HTTP ${res.status}`);
+  if (dataSource === 'live') {
+    const params = new URLSearchParams({ BusStopCode: normalized });
+    if (serviceNo?.trim()) {
+      params.set('ServiceNo', serviceNo.trim());
     }
-    const payload = await res.json();
+
+    const res = await fetch(`${API_CONFIG.arrivalsEndpoint}?${params.toString()}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+
+    if (!res.ok) {
+      let errorMsg = `Transit API returned HTTP ${res.status}`;
+      let errorCode: string | undefined;
+      try {
+        const errBody = (await res.json()) as { error?: string; code?: string };
+        if (errBody.error) errorMsg = errBody.error;
+        if (errBody.code) errorCode = errBody.code;
+      } catch {
+        // Fallback to HTTP status message
+      }
+      throw new BusApiError(errorMsg, errorCode, res.status);
+    }
+
+    const payload = (await res.json()) as BusArrivalResponse;
     return {
       BusStopCode: payload.BusStopCode ?? normalized,
-      Services: payload.Services ?? [],
-      updatedAt: new Date().toISOString(),
+      Services: Array.isArray(payload.Services) ? payload.Services : [],
+      updatedAt: payload.updatedAt ?? new Date().toISOString(),
       isPreviewData: false,
     };
   }
 
-  // Simulated latency for testing loading & error states
+  // Preview mode simulation for UI resilience testing or when LTA_ACCOUNT_KEY is not yet added
   const delayMs = simulatedMode === 'slow-network' ? 950 : 180;
   await new Promise((resolve) => setTimeout(resolve, delayMs));
 
   if (simulatedMode === 'api-error') {
-    throw new Error('Unable to reach transit arrival feed. Check backend connection or retry.');
+    throw new BusApiError(
+      'Simulated error: Unable to reach transit arrival feed.',
+      'SIMULATED_ERROR',
+      502
+    );
   }
 
   if (simulatedMode === 'empty-stop') {
@@ -75,10 +125,15 @@ export async function fetchBusArrivals(
 
   const matchedStop = getStopByCode(normalized);
   if (matchedStop) {
-    return generateSimulatedArrivals(matchedStop);
+    const result = generateSimulatedArrivals(matchedStop);
+    if (serviceNo?.trim()) {
+      result.Services = result.Services.filter(
+        (s) => s.ServiceNo.toLowerCase() === serviceNo.trim().toLowerCase()
+      );
+    }
+    return result;
   }
 
-  // Allow previewing arbitrary valid 5-digit Singapore stop codes so the user can test search UX
   if (/^\d{5}$/.test(normalized)) {
     const fallbackPreviewStop: BusStop = {
       BusStopCode: normalized,
@@ -92,5 +147,9 @@ export async function fetchBusArrivals(
     return generateSimulatedArrivals(fallbackPreviewStop);
   }
 
-  throw new Error('Enter a valid 5-digit Singapore bus stop code (e.g. 09048).');
+  throw new BusApiError(
+    'Enter a valid 5-digit Singapore bus stop code (e.g. 04121).',
+    'INVALID_BUS_STOP_CODE',
+    400
+  );
 }

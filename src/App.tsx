@@ -6,13 +6,20 @@ import { FavoritesView } from './components/FavoritesView';
 import { Header } from './components/Header';
 import { SearchStopBar } from './components/SearchStopBar';
 import { StopDirectoryView } from './components/StopDirectoryView';
-import { fetchBusArrivals, getStopByCode } from './services/busApi';
-import { AppView, BusArrivalResponse, FavoriteStop, SimulatedApiMode } from './types/bus';
+import { BusApiError, fetchApiHealth, fetchBusArrivals, getStopByCode } from './services/busApi';
+import {
+  ApiHealthStatus,
+  AppView,
+  BusArrivalResponse,
+  DataSourceMode,
+  FavoriteStop,
+  SimulatedApiMode,
+} from './types/bus';
 
 const STORAGE_FAVS_KEY = 'bussg:favorites:v1';
 const STORAGE_RECENT_KEY = 'bussg:recent:v1';
 const STORAGE_INIT_KEY = 'bussg:initialized:v1';
-const AUTO_REFRESH_INTERVAL_SEC = 30;
+const AUTO_REFRESH_INTERVAL_SEC = 20;
 
 const DEFAULT_FAVORITES: FavoriteStop[] = [
   {
@@ -47,9 +54,9 @@ function loadInitialFavorites(): FavoriteStop[] {
 function loadInitialRecent(): string[] {
   try {
     const raw = localStorage.getItem(STORAGE_RECENT_KEY);
-    return raw ? (JSON.parse(raw) as string[]) : ['09048', '04121', '14141', '52009'];
+    return raw ? (JSON.parse(raw) as string[]) : ['04121', '09048', '14141', '52009'];
   } catch {
-    return ['09048', '04121', '14141', '52009'];
+    return ['04121', '09048', '14141', '52009'];
   }
 }
 
@@ -59,15 +66,43 @@ export default function App() {
   const [recentStopCodes, setRecentStopCodes] = useState<string[]>(loadInitialRecent);
   const [activeStopCode, setActiveStopCode] = useState<string>(() => {
     const initialFavs = loadInitialFavorites();
-    return initialFavs[0]?.BusStopCode ?? '09048';
+    return initialFavs[0]?.BusStopCode ?? '04121';
   });
 
+  const [healthStatus, setHealthStatus] = useState<ApiHealthStatus | null>(null);
+  const [isCheckingHealth, setIsCheckingHealth] = useState<boolean>(false);
+  const [dataSource, setDataSource] = useState<DataSourceMode>('preview');
   const [arrivals, setArrivals] = useState<BusArrivalResponse | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
   const [secondsToRefresh, setSecondsToRefresh] = useState<number>(AUTO_REFRESH_INTERVAL_SEC);
   const [simulatedMode, setSimulatedMode] = useState<SimulatedApiMode>('live-preview');
+
+  const checkHealth = useCallback(async (autoSwitchToLive: boolean = false) => {
+    setIsCheckingHealth(true);
+    try {
+      const status = await fetchApiHealth();
+      setHealthStatus(status);
+      if (autoSwitchToLive && status.ltaConfigured) {
+        setDataSource('live');
+      }
+    } catch {
+      setHealthStatus({
+        ok: false,
+        ltaConfigured: false,
+        timestamp: new Date().toISOString(),
+      });
+    } finally {
+      setIsCheckingHealth(false);
+    }
+  }, []);
+
+  // Check /api/health on initial mount to auto-enable live LTA DataMall v3 when key is present
+  useEffect(() => {
+    checkHealth(true);
+  }, [checkHealth]);
 
   // Persist favourites
   useEffect(() => {
@@ -89,15 +124,24 @@ export default function App() {
   }, [recentStopCodes]);
 
   const loadArrivals = useCallback(
-    async (stopCode: string, mode: SimulatedApiMode) => {
+    async (stopCode: string, source: DataSourceMode, mode: SimulatedApiMode) => {
       setIsLoading(true);
       setError(null);
+      setErrorCode(null);
       try {
-        const data = await fetchBusArrivals(stopCode, mode);
+        const data = await fetchBusArrivals(stopCode, {
+          dataSource: source,
+          simulatedMode: mode,
+        });
         setArrivals(data);
         setSecondsToRefresh(AUTO_REFRESH_INTERVAL_SEC);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Unable to load bus arrivals.');
+        if (err instanceof BusApiError) {
+          setError(err.message);
+          setErrorCode(err.code ?? null);
+        } else {
+          setError(err instanceof Error ? err.message : 'Unable to load bus arrivals.');
+        }
       } finally {
         setIsLoading(false);
       }
@@ -105,25 +149,25 @@ export default function App() {
     []
   );
 
-  // Fetch when active stop or simulated mode changes
+  // Fetch when active stop, data source, or simulated mode changes
   useEffect(() => {
-    loadArrivals(activeStopCode, simulatedMode);
-  }, [activeStopCode, simulatedMode, loadArrivals]);
+    loadArrivals(activeStopCode, dataSource, simulatedMode);
+  }, [activeStopCode, dataSource, simulatedMode, loadArrivals]);
 
-  // Auto-refresh countdown
+  // Auto-refresh countdown (20s cadence matching LTA DataMall v3)
   useEffect(() => {
     if (!autoRefresh || activeView !== 'arrivals') return;
     const timer = setInterval(() => {
       setSecondsToRefresh((prev) => {
         if (prev <= 1) {
-          loadArrivals(activeStopCode, simulatedMode);
+          loadArrivals(activeStopCode, dataSource, simulatedMode);
           return AUTO_REFRESH_INTERVAL_SEC;
         }
         return prev - 1;
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [autoRefresh, activeView, activeStopCode, simulatedMode, loadArrivals]);
+  }, [autoRefresh, activeView, activeStopCode, dataSource, simulatedMode, loadArrivals]);
 
   const favoriteCodesSet = useMemo(
     () => new Set(favorites.map((f) => f.BusStopCode)),
@@ -183,7 +227,6 @@ export default function App() {
     setFavorites((prev) => {
       const existing = prev.find((f) => f.BusStopCode === stopCode);
       if (!existing) {
-        // Automatically save stop to favourites when pinning a bus service there
         return [
           {
             BusStopCode: stopCode,
@@ -206,7 +249,7 @@ export default function App() {
 
   function handleManualRefresh() {
     setActiveView('arrivals');
-    loadArrivals(activeStopCode, simulatedMode);
+    loadArrivals(activeStopCode, dataSource, simulatedMode);
   }
 
   return (
@@ -280,11 +323,14 @@ export default function App() {
                 arrivals={arrivals}
                 isLoading={isLoading}
                 error={error}
+                errorCode={errorCode}
+                dataSource={dataSource}
+                onChangeDataSource={setDataSource}
                 favoriteEntry={activeFavoriteEntry}
                 autoRefresh={autoRefresh}
                 secondsToRefresh={secondsToRefresh}
                 onToggleAutoRefresh={() => setAutoRefresh((prev) => !prev)}
-                onRefresh={() => loadArrivals(activeStopCode, simulatedMode)}
+                onRefresh={() => loadArrivals(activeStopCode, dataSource, simulatedMode)}
                 onToggleFavoriteStop={handleToggleFavoriteStop}
                 onUpdateFavoriteLabel={handleUpdateFavoriteLabel}
                 onTogglePinService={handleTogglePinService}
@@ -314,6 +360,11 @@ export default function App() {
 
         {activeView === 'api' && (
           <ApiIntegrationView
+            healthStatus={healthStatus}
+            isCheckingHealth={isCheckingHealth}
+            onRefreshHealth={() => checkHealth(true)}
+            dataSource={dataSource}
+            onChangeDataSource={setDataSource}
             simulatedMode={simulatedMode}
             onChangeSimulatedMode={setSimulatedMode}
             onTestOnBoard={() => setActiveView('arrivals')}
@@ -324,14 +375,19 @@ export default function App() {
       <footer className="hidden md:block border-t border-slate-200 bg-white">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex items-center justify-between text-xs text-slate-500">
           <p>
-            BusSG · Frontend preview using simulated Singapore bus arrival schedules
+            BusSG ·{' '}
+            {dataSource === 'live'
+              ? 'Connected to LTA DataMall v3 (/api/busarrival)'
+              : healthStatus?.ltaConfigured
+                ? 'Preview schedules active (Live LTA v3 ready)'
+                : 'Preview schedules active (waiting for LTA_ACCOUNT_KEY)'}
           </p>
           <button
             type="button"
             onClick={() => setActiveView('api')}
             className="font-medium text-teal-700 hover:text-teal-800 hover:underline underline-offset-4"
           >
-            Connect LTA DataMall API
+            API Connection & Health
           </button>
         </div>
       </footer>

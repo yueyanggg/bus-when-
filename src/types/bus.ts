@@ -59,4 +59,14 @@ export interface FavoriteStop {
 
 export type AppView = 'arrivals' | 'favourites' | 'directory' | 'api';
 
+export type DataSourceMode = 'live' | 'preview';
+
 export type SimulatedApiMode = 'live-preview' | 'slow-network' | 'empty-stop' | 'api-error';
+
+export interface ApiHealthStatus {
+  ok: boolean;
+  service?: string;
+  ltaConfigured: boolean;
+  endpoint?: string;
+  timestamp: string;
+}
