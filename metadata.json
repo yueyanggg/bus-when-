@@ -1,0 +1,6 @@
+{
+  "name": "BusSG — Singapore Bus Arrival Tracker",
+  "description": "Real-time Singapore bus arrival board with quick bus stop code search, crowd indicators, and saved favourites.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
